@@ -242,6 +242,7 @@
         success: ['完成啦 ✌', '搞定！', '轻轻松松～', '收工！'],
         error: ['呜哇，出错了…', '别慌，我们再试一次', '碰到点小问题，深呼吸'],
         eat: ['咔嚓咔嚓…token 真香', '好吃！还有吗？', 'yummy！'],
+        stats: ['咔哒！给你看小账本～', '余额和用量，一目了然！', '记账时间到！'],
         fly: ['哇——飞起来了！', '芜湖！', '慢、慢点——'],
         wake: ['早啊…', '唔…几点了？'],
         doze: ['zzz…呼…', '好困…先睡会儿']
@@ -249,6 +250,13 @@
 
       function pick(arr) {
         return arr[Math.floor(Math.random() * arr.length)];
+      }
+
+      function money(w) {
+        if (!w) return '0';
+        var n = Number(w.balance);
+        var v = Number.isFinite(n) ? n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : String(w.balance);
+        return (w.currency === 'USD' ? '$' : '¥') + v;
       }
 
       var CSS = [
@@ -262,6 +270,15 @@
         '.dsc-menu{position:fixed;z-index:2147483000;background:#FFFFFF;border:1px solid #D97757;border-radius:10px;box-shadow:0 6px 24px rgba(61,42,32,.18);padding:4px;min-width:150px;font-size:13px;color:#3D2A20;font-family:inherit;pointer-events:auto;}',
         '.dsc-menu-item{padding:7px 12px;border-radius:7px;cursor:pointer;white-space:nowrap;}',
         '.dsc-menu-item:hover{background:#F5F0E8;}',
+        '.dsc-stats{position:fixed;z-index:2147483000;background:#FFFFFF;border:1px solid #D97757;border-radius:12px;box-shadow:0 6px 24px rgba(61,42,32,.18);padding:12px 14px;min-width:210px;max-width:260px;font-size:12px;line-height:1.7;color:#3D2A20;font-family:inherit;pointer-events:auto;}',
+        '.dsc-stats-hd{font-weight:700;font-size:13px;color:#B95E3B;margin-bottom:6px;display:flex;align-items:center;justify-content:space-between;}',
+        '.dsc-stats-x{cursor:pointer;color:#3D2A20;opacity:.55;padding:0 2px;}',
+        '.dsc-stats-x:hover{opacity:1;}',
+        '.dsc-stats-row{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+        '.dsc-stats-row b{color:#B95E3B;}',
+        '.dsc-stats-links{margin-top:6px;display:flex;gap:6px;}',
+        '.dsc-stats-links a{color:#B95E3B;text-decoration:none;border:1px solid rgba(217,119,87,.5);border-radius:6px;padding:1px 8px;font-size:11px;}',
+        '.dsc-stats-links a:hover{background:#F5F0E8;}',
         '.dsc-restore{position:fixed;right:16px;bottom:16px;width:46px;height:46px;border-radius:50%;background:#D97757;border:2px solid #3D2A20;box-shadow:0 2px 10px rgba(61,42,32,.25);cursor:pointer;pointer-events:auto;z-index:2147483000;display:flex;align-items:center;justify-content:center;}',
         '.dsc-restore canvas{width:30px;height:30px;image-rendering:pixelated;}'
       ].join('');
@@ -321,6 +338,12 @@
         var menuState = React.useState(null);
         var menu = menuState[0];
         var setMenu = menuState[1];
+        var statsState = React.useState(null); // 余额+用量面板数据（/state 快照）
+        var stats = statsState[0];
+        var setStats = statsState[1];
+        var statsRef = React.useRef(null);
+        var statsOpenRef = React.useRef(false);
+        var snapshotRef = React.useRef(null); // 最新 /state 快照
         var hiddenState = React.useState(Boolean(save0 && save0.hidden));
         var hidden = hiddenState[0];
         var setHidden = hiddenState[1];
@@ -562,6 +585,8 @@
               .then(function (s) {
                 if (stopped || !s || s.ok === false) return;
                 applyWorkState(s.state || null, s.task || null, false);
+                snapshotRef.current = s;
+                if (statsOpenRef.current) setStats(s); // 面板开着时持续刷新
               })
               .catch(function () { /* 宿主未就绪时静默 */ });
           }
@@ -600,14 +625,22 @@
         var hiddenRef = React.useRef(hidden);
         hiddenRef.current = hidden;
 
-        // —— 菜单外部点击 / Esc 关闭 ——
+        // —— 菜单 / 面板外部点击 / Esc 关闭 ——
         React.useEffect(function () {
-          if (!menu) return undefined;
+          if (!menu && !stats) return undefined;
           function onDoc(e) {
             if (menuRef.current && !menuRef.current.contains(e.target)) setMenu(null);
+            if (statsRef.current && !statsRef.current.contains(e.target)) {
+              statsOpenRef.current = false;
+              setStats(null);
+            }
           }
           function onKey(e) {
-            if (e.key === 'Escape') setMenu(null);
+            if (e.key === 'Escape') {
+              setMenu(null);
+              statsOpenRef.current = false;
+              setStats(null);
+            }
           }
           document.addEventListener('pointerdown', onDoc, true);
           document.addEventListener('keydown', onKey);
@@ -615,7 +648,7 @@
             document.removeEventListener('pointerdown', onDoc, true);
             document.removeEventListener('keydown', onKey);
           };
-        }, [menu]);
+        }, [menu, stats]);
 
         // —— 首次问候 ——
         React.useEffect(function () {
@@ -681,8 +714,14 @@
         function onDoubleClick(e) {
           var s = st.current;
           s.lastActivity = Date.now();
-          setMood('eat', Date.now() + 900);
-          bubbleSay(pick(QUIPS.eat));
+          if (statsOpenRef.current) {
+            statsOpenRef.current = false;
+            setStats(null);
+          } else {
+            statsOpenRef.current = true;
+            setStats(snapshotRef.current || null);
+            bubbleSay(pick(QUIPS.stats), 2500);
+          }
         }
         function onContextMenu(e) {
           e.preventDefault();
@@ -701,6 +740,7 @@
           var items = [
             { label: '💬 说句话', fn: function () { setMood('happy', Date.now() + 1400); bubbleSay(pick(QUIPS.click)); } },
             { label: '🍪 吃个 token', fn: function () { setMood('eat', Date.now() + 900); bubbleSay(pick(QUIPS.eat)); } },
+            { label: '🧾 余额 / 用量', fn: function () { statsOpenRef.current = !statsOpenRef.current; setStats(statsOpenRef.current ? (snapshotRef.current || null) : null); } },
             { label: asleepRef.current ? '😃 起床' : '😴 睡觉', fn: toggleAsleep },
             { label: '📐 大小 ×' + scaleRef.current, fn: function () { var i = SCALES.indexOf(scaleRef.current); if (i < 0) i = 3; var n = SCALES[(i + 1) % SCALES.length]; setScale(n); persistNow(); } },
             { label: '🧭 回到底部', fn: function () { var s = st.current; s.y = sizeNow().floor; s.vx = 0; s.vy = 0; setMood('idle'); persistNow(); } },
@@ -745,6 +785,71 @@
           bubbleEl = React.createElement('div', { key: bubble.id, className: 'dsc-bubble' }, bubble.text);
         }
 
+        var statsEl = null;
+        if (stats) {
+          var sx = Math.max(8, Math.min(st.current.x, (window.innerWidth || 0) - 280));
+          var sy = Math.max(8, st.current.y - 190);
+          var rows = [];
+
+          // —— 余额 ——
+          var bal = stats.balance;
+          if (stats.account === 'unavailable') {
+            rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' }, '💰 余额：账户服务不可用'));
+          } else if (stats.account === 'signed-out') {
+            rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' }, '💰 余额：未登录 DeepSeek 账户'));
+          } else if (bal && bal.status === 'ready') {
+            var main = (bal.wallets || []).map(function (w) { return money(w); }).join(' + ') || '0';
+            rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' }, '💰 余额：', React.createElement('b', null, main)));
+            if (bal.bonusWallets && bal.bonusWallets.length > 0) {
+              var bonus = bal.bonusWallets.map(function (w) { return money(w); }).join(' + ');
+              rows.push(React.createElement('div', { key: 'bonus', className: 'dsc-stats-row' }, '🎁 赠送：', React.createElement('b', null, bonus)));
+            }
+          } else if (bal && bal.status === 'failed') {
+            rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' }, '💰 余额：查询失败'));
+          } else {
+            rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' }, '💰 余额：加载中…'));
+          }
+
+          // —— 会话用量 ——
+          var u = stats.usage;
+          if (u) {
+            rows.push(React.createElement('div', { key: 'use', className: 'dsc-stats-row' },
+              '📊 本会话：输入 ', React.createElement('b', null, u.input.toLocaleString()),
+              ' · 输出 ', React.createElement('b', null, u.output.toLocaleString()),
+              u.cacheRead ? ' · 缓存读 ' + u.cacheRead.toLocaleString() : '',
+              u.cacheWrite ? ' · 缓存写 ' + u.cacheWrite.toLocaleString() : ''));
+          } else {
+            rows.push(React.createElement('div', { key: 'use', className: 'dsc-stats-row' }, '📊 本会话：暂无用量'));
+          }
+
+          // —— 快捷链接 ——
+          if (stats.links && (stats.links.usageUrl || stats.links.topUpUrl)) {
+            var links = [];
+            if (stats.links.usageUrl) {
+              links.push(React.createElement('a', { key: 'u', href: stats.links.usageUrl, target: '_blank', rel: 'noreferrer' }, '用量明细'));
+            }
+            if (stats.links.topUpUrl) {
+              links.push(React.createElement('a', { key: 't', href: stats.links.topUpUrl, target: '_blank', rel: 'noreferrer' }, '充值'));
+            }
+            rows.push(React.createElement('div', { key: 'links', className: 'dsc-stats-links' }, links));
+          }
+
+          statsEl = React.createElement('div', {
+            className: 'dsc-stats',
+            ref: statsRef,
+            style: { left: sx, top: sy },
+            onPointerDown: function (e) { e.stopPropagation(); }
+          },
+          React.createElement('div', { className: 'dsc-stats-hd' },
+            '🧾 Clawd 小账本',
+            React.createElement('span', {
+              className: 'dsc-stats-x',
+              title: '关闭',
+              onClick: function () { statsOpenRef.current = false; setStats(null); }
+            }, '✕')),
+          rows);
+        }
+
         return React.createElement('div', {
           className: 'dsc-root',
           ref: rootRef,
@@ -764,7 +869,8 @@
         React.createElement('canvas', { ref: canvasRef, width: GRID, height: GRID }),
         React.createElement('div', { className: 'dsc-shadow', ref: shadowRef }),
         bubbleEl),
-        menuEl);
+        menuEl,
+        statsEl);
       }
 
       // 隐藏后的召回按钮：画个星芒小头像
