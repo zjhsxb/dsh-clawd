@@ -259,6 +259,44 @@
         return (w.currency === 'USD' ? '$' : '¥') + v;
       }
 
+      // 余额总额（充值 + 赠送，按货币合并）
+      function totalBalance(bal) {
+        var wallets = (bal.wallets || []).concat(bal.bonusWallets || []);
+        var byCur = {};
+        wallets.forEach(function (w) {
+          if (!w || w.currency === undefined) return;
+          var n = Number(w.balance);
+          if (!Number.isFinite(n)) return;
+          byCur[w.currency] = (byCur[w.currency] || 0) + n;
+        });
+        var keys = Object.keys(byCur);
+        if (keys.length === 0) return null;
+        return keys.map(function (cur) {
+          return (cur === 'USD' ? '$' : '¥') + byCur[cur].toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }).join(' + ');
+      }
+
+      // 会话费用估算（CNY，按 DeepSeek 官方标准时段单价，百万 token）
+      // deepseek-chat: 输入缓存命中 ¥0.5 / 未命中 ¥2 / 输出 ¥8
+      // deepseek-reasoner: 命中 ¥1 / 未命中 ¥4 / 输出 ¥16（reasoning 按输出计）
+      function estimateCost(u, model) {
+        if (!u) return null;
+        var reasoner = /reasoner|r1/i.test(String(model || ''));
+        var hit = reasoner ? 1 : 0.5;
+        var miss = reasoner ? 4 : 2;
+        var out = reasoner ? 16 : 8;
+        var input = Number(u.input) || 0;
+        var cacheRead = Number(u.cacheRead) || 0;
+        var output = Number(u.output) || 0;
+        var reasoning = Number(u.reasoning) || 0;
+        var uncached = Math.max(0, input - cacheRead);
+        return (uncached / 1e6) * miss + (cacheRead / 1e6) * hit + (output / 1e6) * out + (reasoning / 1e6) * out;
+      }
+
+      function fmtMoney(v) {
+        return '¥' + v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      }
+
       var CSS = [
         '.dsc-root{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:20;}',
         '.dsc-pet{position:absolute;left:0;top:0;width:24px;height:24px;pointer-events:auto;cursor:grab;touch-action:none;user-select:none;}',
@@ -792,47 +830,20 @@
           var rows = [];
 
           // —— 余额 ——
-          var bal = stats.balance;
-          if (stats.account === 'unavailable') {
-            rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' }, '💰 余额：账户服务不可用'));
-          } else if (stats.account === 'signed-out') {
-            rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' }, '💰 余额：未登录 DeepSeek 账户'));
-          } else if (bal && bal.status === 'ready') {
-            var main = (bal.wallets || []).map(function (w) { return money(w); }).join(' + ') || '0';
-            rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' }, '💰 余额：', React.createElement('b', null, main)));
-            if (bal.bonusWallets && bal.bonusWallets.length > 0) {
-              var bonus = bal.bonusWallets.map(function (w) { return money(w); }).join(' + ');
-              rows.push(React.createElement('div', { key: 'bonus', className: 'dsc-stats-row' }, '🎁 赠送：', React.createElement('b', null, bonus)));
-            }
-          } else if (bal && bal.status === 'failed') {
-            rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' }, '💰 余额：查询失败'));
-          } else {
-            rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' }, '💰 余额：加载中…'));
-          }
+          var balText;
+          if (stats.account === 'unavailable') balText = '账户服务不可用';
+          else if (stats.account === 'signed-out') balText = '未登录 DeepSeek';
+          else if (stats.balance && stats.balance.status === 'ready') balText = totalBalance(stats.balance) || '—';
+          else if (stats.balance && stats.balance.status === 'failed') balText = '查询失败';
+          else balText = '加载中…';
+          rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' },
+            '💰 余额 ', React.createElement('b', null, balText)));
 
-          // —— 会话用量 ——
-          var u = stats.usage;
-          if (u) {
-            rows.push(React.createElement('div', { key: 'use', className: 'dsc-stats-row' },
-              '📊 本会话：输入 ', React.createElement('b', null, u.input.toLocaleString()),
-              ' · 输出 ', React.createElement('b', null, u.output.toLocaleString()),
-              u.cacheRead ? ' · 缓存读 ' + u.cacheRead.toLocaleString() : '',
-              u.cacheWrite ? ' · 缓存写 ' + u.cacheWrite.toLocaleString() : ''));
-          } else {
-            rows.push(React.createElement('div', { key: 'use', className: 'dsc-stats-row' }, '📊 本会话：暂无用量'));
-          }
-
-          // —— 快捷链接 ——
-          if (stats.links && (stats.links.usageUrl || stats.links.topUpUrl)) {
-            var links = [];
-            if (stats.links.usageUrl) {
-              links.push(React.createElement('a', { key: 'u', href: stats.links.usageUrl, target: '_blank', rel: 'noreferrer' }, '用量明细'));
-            }
-            if (stats.links.topUpUrl) {
-              links.push(React.createElement('a', { key: 't', href: stats.links.topUpUrl, target: '_blank', rel: 'noreferrer' }, '充值'));
-            }
-            rows.push(React.createElement('div', { key: 'links', className: 'dsc-stats-links' }, links));
-          }
+          // —— 会话费用（估算）——
+          var cost = estimateCost(stats.usage, stats.model);
+          rows.push(React.createElement('div', { key: 'use', className: 'dsc-stats-row' },
+            '📊 会话 ',
+            React.createElement('b', null, cost === null ? '暂无用量' : fmtMoney(cost))));
 
           statsEl = React.createElement('div', {
             className: 'dsc-stats',

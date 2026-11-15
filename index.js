@@ -130,6 +130,19 @@ export function apply(ctx) {
     u.reasoning += num(usage.reasoningTokens);
   };
 
+  // —— 当前默认模型名缓存（客户端按模型折算会话费用，60s 刷新）——
+  let modelCache = { at: 0, value: null };
+  const currentModel = () => {
+    if (modelCache.at && Date.now() - modelCache.at < 60000) return modelCache.value;
+    try {
+      const sel = ctx.get?.('agentDefaultModel')?.currentSelection?.();
+      modelCache = { at: Date.now(), value: sel?.model ?? null };
+    } catch {
+      modelCache = { at: Date.now(), value: null };
+    }
+    return modelCache.value;
+  };
+
   // —— DeepSeek 账户余额缓存（deepseekAccount 是可选服务，缺失时优雅降级）——
   // 60s 刷新一次，/state 只读缓存，保持轮询低延迟。
   let balanceCache = { at: 0, value: null }; // value = { account, links, balance }
@@ -176,6 +189,7 @@ export function apply(ctx) {
       task: e?.task ?? null,
       sessionId: e?.sessionId ?? null,
       usage: e ? usageOf(e.sessionId) : null,
+      model: currentModel(),
       account: b?.account ?? 'unavailable',
       links: b?.links ?? null,
       balance: b?.balance ?? null,
