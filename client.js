@@ -221,6 +221,7 @@
       var BOUNCE = 0.45;
       var THROW_MIN = 3.5;
       var STORAGE_KEY = 'dsh-clawd:v3'; // v3: 默认 3×，旧存档（≤2×）作废
+      var SCALES = [1.5, 2, 2.5, 3, 3.5, 4, 5]; // 右键菜单大小挡位循环
 
       var MOOD_BY_STATE = {
         thinking: 'think',
@@ -701,7 +702,7 @@
             { label: '💬 说句话', fn: function () { setMood('happy', Date.now() + 1400); bubbleSay(pick(QUIPS.click)); } },
             { label: '🍪 吃个 token', fn: function () { setMood('eat', Date.now() + 900); bubbleSay(pick(QUIPS.eat)); } },
             { label: asleepRef.current ? '😃 起床' : '😴 睡觉', fn: toggleAsleep },
-            { label: '📐 大小 ×' + scaleRef.current, fn: function () { var n = scaleRef.current === 1.5 ? 2 : (scaleRef.current === 2 ? 3 : 1.5); setScale(n); persistNow(); } },
+            { label: '📐 大小 ×' + scaleRef.current, fn: function () { var i = SCALES.indexOf(scaleRef.current); if (i < 0) i = 3; var n = SCALES[(i + 1) % SCALES.length]; setScale(n); persistNow(); } },
             { label: '🧭 回到底部', fn: function () { var s = st.current; s.y = sizeNow().floor; s.vx = 0; s.vy = 0; setMood('idle'); persistNow(); } },
             { label: '🙈 藏起来', fn: function () { setHidden(true); persistNow(); } }
           ];
