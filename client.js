@@ -220,7 +220,7 @@
       var GRAVITY = 0.45;
       var BOUNCE = 0.45;
       var THROW_MIN = 3.5;
-      var STORAGE_KEY = 'dsh-clawd:v2'; // v2: 默认 2×，旧存档（1×）作废
+      var STORAGE_KEY = 'dsh-clawd:v3'; // v3: 默认 3×，旧存档（≤2×）作废
 
       var MOOD_BY_STATE = {
         thinking: 'think',
@@ -312,7 +312,7 @@
         var menuRef = React.useRef(null);
 
         var save0 = React.useMemo(loadSave, []);
-        var initialScale = (save0 && save0.scale) || 2; // 默认 2×（48px），像素风整数缩放更清晰
+        var initialScale = (save0 && save0.scale) || 3; // 默认 3×（72px），像素风整数缩放更清晰
 
         var bubbleState = React.useState(null);
         var bubble = bubbleState[0];
@@ -701,7 +701,7 @@
             { label: '💬 说句话', fn: function () { setMood('happy', Date.now() + 1400); bubbleSay(pick(QUIPS.click)); } },
             { label: '🍪 吃个 token', fn: function () { setMood('eat', Date.now() + 900); bubbleSay(pick(QUIPS.eat)); } },
             { label: asleepRef.current ? '😃 起床' : '😴 睡觉', fn: toggleAsleep },
-            { label: '📐 大小 ×' + scaleRef.current, fn: function () { var n = scaleRef.current === 1 ? 1.5 : (scaleRef.current === 1.5 ? 2 : 1); setScale(n); persistNow(); } },
+            { label: '📐 大小 ×' + scaleRef.current, fn: function () { var n = scaleRef.current === 1.5 ? 2 : (scaleRef.current === 2 ? 3 : 1.5); setScale(n); persistNow(); } },
             { label: '🧭 回到底部', fn: function () { var s = st.current; s.y = sizeNow().floor; s.vx = 0; s.vy = 0; setMood('idle'); persistNow(); } },
             { label: '🙈 藏起来', fn: function () { setHidden(true); persistNow(); } }
           ];
