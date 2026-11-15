@@ -1,0 +1,5 @@
+# Insert the dsh-clawd plugin entry into the profile's plugin list.
+# The `id` line must not carry a trailing comment (marketplace preflight regex).
+- insert:
+    - id: dsh-clawd
+      name: 'dsh-clawd'
