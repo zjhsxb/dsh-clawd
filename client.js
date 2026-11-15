@@ -242,7 +242,6 @@
         success: ['完成啦 ✌', '搞定！', '轻轻松松～', '收工！'],
         error: ['呜哇，出错了…', '别慌，我们再试一次', '碰到点小问题，深呼吸'],
         eat: ['咔嚓咔嚓…token 真香', '好吃！还有吗？', 'yummy！'],
-        stats: ['咔哒！给你看小账本～', '余额和用量，一目了然！', '记账时间到！'],
         fly: ['哇——飞起来了！', '芜湖！', '慢、慢点——'],
         wake: ['早啊…', '唔…几点了？'],
         doze: ['zzz…呼…', '好困…先睡会儿']
@@ -250,13 +249,6 @@
 
       function pick(arr) {
         return arr[Math.floor(Math.random() * arr.length)];
-      }
-
-      function money(w) {
-        if (!w) return '0';
-        var n = Number(w.balance);
-        var v = Number.isFinite(n) ? n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : String(w.balance);
-        return (w.currency === 'USD' ? '$' : '¥') + v;
       }
 
       // 余额总额（充值 + 赠送，按货币合并）
@@ -297,26 +289,31 @@
         return '¥' + v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       }
 
+      // 双击账本：从 /state 快照生成两行气泡文本（余额 + 会话费用估算）
+      function ledgerLines(snap) {
+        snap = snap || {};
+        var bal;
+        if (snap.account === 'unavailable') bal = '账户服务不可用';
+        else if (snap.account === 'signed-out') bal = '未登录 DeepSeek';
+        else if (snap.balance && snap.balance.status === 'ready') bal = totalBalance(snap.balance) || '—';
+        else if (snap.balance && snap.balance.status === 'failed') bal = '查询失败';
+        else bal = '加载中…';
+        var cost = estimateCost(snap.usage, snap.model);
+        var line2 = cost === null ? '暂无用量' : fmtMoney(cost);
+        return '💰 余额：' + bal + '\n📊 会话：' + line2;
+      }
+
       var CSS = [
         '.dsc-root{position:absolute;inset:0;pointer-events:none;overflow:hidden;z-index:20;}',
         '.dsc-pet{position:absolute;left:0;top:0;width:24px;height:24px;pointer-events:auto;cursor:grab;touch-action:none;user-select:none;}',
         '.dsc-pet:active{cursor:grabbing;}',
         '.dsc-pet canvas{width:100%;height:100%;image-rendering:pixelated;display:block;}',
         '.dsc-shadow{position:absolute;left:50%;bottom:-3px;transform:translateX(-50%);border-radius:50%;background:rgba(61,42,32,.15);height:6px;}',
-        '.dsc-bubble{position:absolute;bottom:calc(100% + 10px);left:50%;transform:translateX(-50%);background:#F5F0E8;border:1px solid #D97757;color:#3D2A20;font-size:12px;line-height:1.5;padding:6px 10px;border-radius:10px;max-width:240px;box-shadow:0 2px 8px rgba(61,42,32,.12);pointer-events:none;white-space:normal;word-break:break-all;}',
+        '.dsc-bubble{position:absolute;bottom:calc(100% + 10px);left:50%;transform:translateX(-50%);background:#F5F0E8;border:1px solid #D97757;color:#3D2A20;font-size:12px;line-height:1.5;padding:6px 10px;border-radius:10px;max-width:240px;box-shadow:0 2px 8px rgba(61,42,32,.12);pointer-events:none;white-space:pre-line;word-break:break-all;text-align:left;}',
         '.dsc-bubble::after{content:"";position:absolute;top:100%;left:50%;transform:translateX(-50%);border:6px solid transparent;border-top-color:#D97757;}',
         '.dsc-menu{position:fixed;z-index:2147483000;background:#FFFFFF;border:1px solid #D97757;border-radius:10px;box-shadow:0 6px 24px rgba(61,42,32,.18);padding:4px;min-width:150px;font-size:13px;color:#3D2A20;font-family:inherit;pointer-events:auto;}',
         '.dsc-menu-item{padding:7px 12px;border-radius:7px;cursor:pointer;white-space:nowrap;}',
         '.dsc-menu-item:hover{background:#F5F0E8;}',
-        '.dsc-stats{position:fixed;z-index:2147483000;background:#FFFFFF;border:1px solid #D97757;border-radius:12px;box-shadow:0 6px 24px rgba(61,42,32,.18);padding:12px 14px;min-width:210px;max-width:260px;font-size:12px;line-height:1.7;color:#3D2A20;font-family:inherit;pointer-events:auto;}',
-        '.dsc-stats-hd{font-weight:700;font-size:13px;color:#B95E3B;margin-bottom:6px;display:flex;align-items:center;justify-content:space-between;}',
-        '.dsc-stats-x{cursor:pointer;color:#3D2A20;opacity:.55;padding:0 2px;}',
-        '.dsc-stats-x:hover{opacity:1;}',
-        '.dsc-stats-row{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
-        '.dsc-stats-row b{color:#B95E3B;}',
-        '.dsc-stats-links{margin-top:6px;display:flex;gap:6px;}',
-        '.dsc-stats-links a{color:#B95E3B;text-decoration:none;border:1px solid rgba(217,119,87,.5);border-radius:6px;padding:1px 8px;font-size:11px;}',
-        '.dsc-stats-links a:hover{background:#F5F0E8;}',
         '.dsc-restore{position:fixed;right:16px;bottom:16px;width:46px;height:46px;border-radius:50%;background:#D97757;border:2px solid #3D2A20;box-shadow:0 2px 10px rgba(61,42,32,.25);cursor:pointer;pointer-events:auto;z-index:2147483000;display:flex;align-items:center;justify-content:center;}',
         '.dsc-restore canvas{width:30px;height:30px;image-rendering:pixelated;}'
       ].join('');
@@ -376,12 +373,7 @@
         var menuState = React.useState(null);
         var menu = menuState[0];
         var setMenu = menuState[1];
-        var statsState = React.useState(null); // 余额+用量面板数据（/state 快照）
-        var stats = statsState[0];
-        var setStats = statsState[1];
-        var statsRef = React.useRef(null);
-        var statsOpenRef = React.useRef(false);
-        var snapshotRef = React.useRef(null); // 最新 /state 快照
+        var snapshotRef = React.useRef(null); // 最新 /state 快照（双击时读余额/用量）
         var hiddenState = React.useState(Boolean(save0 && save0.hidden));
         var hidden = hiddenState[0];
         var setHidden = hiddenState[1];
@@ -624,7 +616,6 @@
                 if (stopped || !s || s.ok === false) return;
                 applyWorkState(s.state || null, s.task || null, false);
                 snapshotRef.current = s;
-                if (statsOpenRef.current) setStats(s); // 面板开着时持续刷新
               })
               .catch(function () { /* 宿主未就绪时静默 */ });
           }
@@ -663,22 +654,14 @@
         var hiddenRef = React.useRef(hidden);
         hiddenRef.current = hidden;
 
-        // —— 菜单 / 面板外部点击 / Esc 关闭 ——
+        // —— 菜单外部点击 / Esc 关闭 ——
         React.useEffect(function () {
-          if (!menu && !stats) return undefined;
+          if (!menu) return undefined;
           function onDoc(e) {
             if (menuRef.current && !menuRef.current.contains(e.target)) setMenu(null);
-            if (statsRef.current && !statsRef.current.contains(e.target)) {
-              statsOpenRef.current = false;
-              setStats(null);
-            }
           }
           function onKey(e) {
-            if (e.key === 'Escape') {
-              setMenu(null);
-              statsOpenRef.current = false;
-              setStats(null);
-            }
+            if (e.key === 'Escape') setMenu(null);
           }
           document.addEventListener('pointerdown', onDoc, true);
           document.addEventListener('keydown', onKey);
@@ -686,7 +669,7 @@
             document.removeEventListener('pointerdown', onDoc, true);
             document.removeEventListener('keydown', onKey);
           };
-        }, [menu, stats]);
+        }, [menu]);
 
         // —— 首次问候 ——
         React.useEffect(function () {
@@ -752,14 +735,8 @@
         function onDoubleClick(e) {
           var s = st.current;
           s.lastActivity = Date.now();
-          if (statsOpenRef.current) {
-            statsOpenRef.current = false;
-            setStats(null);
-          } else {
-            statsOpenRef.current = true;
-            setStats(snapshotRef.current || null);
-            bubbleSay(pick(QUIPS.stats), 2500);
-          }
+          setMood('happy', Date.now() + 1400);
+          bubbleSay(ledgerLines(snapshotRef.current), 8000); // 覆盖当前气泡，直接显示余额+会话两行
         }
         function onContextMenu(e) {
           e.preventDefault();
@@ -778,7 +755,7 @@
           var items = [
             { label: '💬 说句话', fn: function () { setMood('happy', Date.now() + 1400); bubbleSay(pick(QUIPS.click)); } },
             { label: '🍪 吃个 token', fn: function () { setMood('eat', Date.now() + 900); bubbleSay(pick(QUIPS.eat)); } },
-            { label: '🧾 余额 / 用量', fn: function () { statsOpenRef.current = !statsOpenRef.current; setStats(statsOpenRef.current ? (snapshotRef.current || null) : null); } },
+            { label: '🧾 余额 / 用量', fn: function () { setMood('happy', Date.now() + 1400); bubbleSay(ledgerLines(snapshotRef.current), 8000); } },
             { label: asleepRef.current ? '😃 起床' : '😴 睡觉', fn: toggleAsleep },
             { label: '📐 大小 ×' + scaleRef.current, fn: function () { var i = SCALES.indexOf(scaleRef.current); if (i < 0) i = 3; var n = SCALES[(i + 1) % SCALES.length]; setScale(n); persistNow(); } },
             { label: '🧭 回到底部', fn: function () { var s = st.current; s.y = sizeNow().floor; s.vx = 0; s.vy = 0; setMood('idle'); persistNow(); } },
@@ -823,44 +800,6 @@
           bubbleEl = React.createElement('div', { key: bubble.id, className: 'dsc-bubble' }, bubble.text);
         }
 
-        var statsEl = null;
-        if (stats) {
-          var sx = Math.max(8, Math.min(st.current.x, (window.innerWidth || 0) - 280));
-          var sy = Math.max(8, st.current.y - 190);
-          var rows = [];
-
-          // —— 余额 ——
-          var balText;
-          if (stats.account === 'unavailable') balText = '账户服务不可用';
-          else if (stats.account === 'signed-out') balText = '未登录 DeepSeek';
-          else if (stats.balance && stats.balance.status === 'ready') balText = totalBalance(stats.balance) || '—';
-          else if (stats.balance && stats.balance.status === 'failed') balText = '查询失败';
-          else balText = '加载中…';
-          rows.push(React.createElement('div', { key: 'bal', className: 'dsc-stats-row' },
-            '💰 余额 ', React.createElement('b', null, balText)));
-
-          // —— 会话费用（估算）——
-          var cost = estimateCost(stats.usage, stats.model);
-          rows.push(React.createElement('div', { key: 'use', className: 'dsc-stats-row' },
-            '📊 会话 ',
-            React.createElement('b', null, cost === null ? '暂无用量' : fmtMoney(cost))));
-
-          statsEl = React.createElement('div', {
-            className: 'dsc-stats',
-            ref: statsRef,
-            style: { left: sx, top: sy },
-            onPointerDown: function (e) { e.stopPropagation(); }
-          },
-          React.createElement('div', { className: 'dsc-stats-hd' },
-            '🧾 Clawd 小账本',
-            React.createElement('span', {
-              className: 'dsc-stats-x',
-              title: '关闭',
-              onClick: function () { statsOpenRef.current = false; setStats(null); }
-            }, '✕')),
-          rows);
-        }
-
         return React.createElement('div', {
           className: 'dsc-root',
           ref: rootRef,
@@ -880,8 +819,7 @@
         React.createElement('canvas', { ref: canvasRef, width: GRID, height: GRID }),
         React.createElement('div', { className: 'dsc-shadow', ref: shadowRef }),
         bubbleEl),
-        menuEl,
-        statsEl);
+        menuEl);
       }
 
       // 隐藏后的召回按钮：画个星芒小头像
