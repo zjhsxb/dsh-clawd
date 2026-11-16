@@ -271,6 +271,8 @@
       // 会话费用估算（CNY，按 DeepSeek 官方标准时段单价，百万 token）
       // deepseek-chat: 输入缓存命中 ¥0.5 / 未命中 ¥2 / 输出 ¥8
       // deepseek-reasoner: 命中 ¥1 / 未命中 ¥4 / 输出 ¥16（reasoning 按输出计）
+      // 注意：宿主上报的 input 已不含 cacheRead（total = input + output + cacheRead），
+      // 所以未命中输入直接用 input；cacheWrite 按未命中价计。
       function estimateCost(u, model) {
         if (!u) return null;
         var reasoner = /reasoner|r1/i.test(String(model || ''));
@@ -279,10 +281,10 @@
         var out = reasoner ? 16 : 8;
         var input = Number(u.input) || 0;
         var cacheRead = Number(u.cacheRead) || 0;
+        var cacheWrite = Number(u.cacheWrite) || 0;
         var output = Number(u.output) || 0;
         var reasoning = Number(u.reasoning) || 0;
-        var uncached = Math.max(0, input - cacheRead);
-        return (uncached / 1e6) * miss + (cacheRead / 1e6) * hit + (output / 1e6) * out + (reasoning / 1e6) * out;
+        return ((input + cacheWrite) / 1e6) * miss + (cacheRead / 1e6) * hit + (output / 1e6) * out + (reasoning / 1e6) * out;
       }
 
       function fmtMoney(v) {
