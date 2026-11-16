@@ -93,6 +93,10 @@ export function apply(ctx) {
   // entry = { state, task, sessionId, seq, turn: {goalRound, closing}, tools: Map, timers }
   const entries = new Map();
 
+  // 最近一次有事件到达的会话（条目被终态清理后，仍用它读出累计用量，
+  // 否则空闲期双击螃蟹会显示"暂无用量"）
+  let lastSessionId = null;
+
   // —— 会话 token 用量累计（来自 assistant/message 事件的 usage 字段）——
   // 同一条 assistant 消息（turn:step 相同）只计一次，避免流式重复计数。
   const usageBySession = new Map(); // sessionId -> { input, output, cacheRead, cacheWrite, reasoning, seen:Set }
@@ -183,12 +187,13 @@ export function apply(ctx) {
 
   const snapshot = () => {
     const e = pickDisplayed();
+    const sid = e?.sessionId ?? lastSessionId;
     const b = balanceCache.value;
     return {
       state: e?.state ?? null,
       task: e?.task ?? null,
-      sessionId: e?.sessionId ?? null,
-      usage: e ? usageOf(e.sessionId) : null,
+      sessionId: sid ?? null,
+      usage: sid ? usageOf(sid) : null,
       model: currentModel(),
       account: b?.account ?? 'unavailable',
       links: b?.links ?? null,
@@ -295,6 +300,7 @@ export function apply(ctx) {
     const dispose = ctx.on('session/event', (session, event) => {
       if (!event || typeof event.type !== 'string') return;
       const sessionId = String(session?.header?.id ?? session?.id ?? 'unknown');
+      lastSessionId = sessionId;
       let e = entries.get(sessionId);
 
       switch (event.type) {

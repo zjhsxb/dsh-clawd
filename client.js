@@ -676,6 +676,10 @@
           if (st.current.saidHello) return;
           st.current.saidHello = true;
           setTimeout(function () { bubbleSay(QUIPS.hello, 4000); }, 800);
+          // 再提醒一次"双击看余额"，保证新打开页面的人能看到
+          setTimeout(function () {
+            bubbleSay('🦀 您可以双击我查看余额哦～', 6000);
+          }, 15000);
         }, []);
 
         // —— 交互 ——
