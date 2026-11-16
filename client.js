@@ -362,6 +362,8 @@
         var canvasRef = React.useRef(null);
         var shadowRef = React.useRef(null);
         var bubbleTimerRef = React.useRef(null);
+        var bubbleKindRef = React.useRef(null); // 'ledger' = 当前气泡是余额账本，随轮询实时刷新
+        var lastLedgerRef = React.useRef('');
         var menuRef = React.useRef(null);
 
         var save0 = React.useMemo(loadSave, []);
@@ -411,11 +413,16 @@
           saidHello: false
         });
 
-        function bubbleSay(text, ms) {
+        function bubbleSay(text, ms, kind) {
           if (!text) return;
+          bubbleKindRef.current = kind || null;
+          lastLedgerRef.current = kind === 'ledger' ? text : '';
           setBubble({ text: text, id: Date.now() + Math.random() });
           if (bubbleTimerRef.current) clearTimeout(bubbleTimerRef.current);
-          bubbleTimerRef.current = setTimeout(function () { setBubble(null); }, ms || 3800);
+          bubbleTimerRef.current = setTimeout(function () {
+            bubbleKindRef.current = null;
+            setBubble(null);
+          }, ms || 3800);
         }
 
         function setMood(mood, untilMs) {
@@ -616,6 +623,14 @@
                 if (stopped || !s || s.ok === false) return;
                 applyWorkState(s.state || null, s.task || null, false);
                 snapshotRef.current = s;
+                // 账本气泡展示期间，余额/用量更新时实时刷新文字，不用再双击一次
+                if (bubbleKindRef.current === 'ledger') {
+                  var text = ledgerLines(s);
+                  if (text !== lastLedgerRef.current) {
+                    lastLedgerRef.current = text;
+                    setBubble({ text: text, id: Date.now() });
+                  }
+                }
               })
               .catch(function () { /* 宿主未就绪时静默 */ });
           }
@@ -740,7 +755,7 @@
           var s = st.current;
           s.lastActivity = Date.now();
           setMood('happy', Date.now() + 1400);
-          bubbleSay(ledgerLines(snapshotRef.current), 8000); // 覆盖当前气泡，直接显示余额+会话两行
+          bubbleSay(ledgerLines(snapshotRef.current), 8000, 'ledger'); // 覆盖当前气泡，直接显示余额+会话两行
         }
         function onContextMenu(e) {
           e.preventDefault();
@@ -759,7 +774,7 @@
           var items = [
             { label: '💬 说句话', fn: function () { setMood('happy', Date.now() + 1400); bubbleSay(pick(QUIPS.click)); } },
             { label: '🍪 吃个 token', fn: function () { setMood('eat', Date.now() + 900); bubbleSay(pick(QUIPS.eat)); } },
-            { label: '🧾 余额 / 用量', fn: function () { setMood('happy', Date.now() + 1400); bubbleSay(ledgerLines(snapshotRef.current), 8000); } },
+            { label: '🧾 余额 / 用量', fn: function () { setMood('happy', Date.now() + 1400); bubbleSay(ledgerLines(snapshotRef.current), 8000, 'ledger'); } },
             { label: asleepRef.current ? '😃 起床' : '😴 睡觉', fn: toggleAsleep },
             { label: '📐 大小 ×' + scaleRef.current, fn: function () { var i = SCALES.indexOf(scaleRef.current); if (i < 0) i = 3; var n = SCALES[(i + 1) % SCALES.length]; setScale(n); persistNow(); } },
             { label: '🧭 回到底部', fn: function () { var s = st.current; s.y = sizeNow().floor; s.vx = 0; s.vy = 0; setMood('idle'); persistNow(); } },

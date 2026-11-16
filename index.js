@@ -5,6 +5,9 @@
 
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 export const name = 'clawd';
 export const inject = ['webServer'];
@@ -99,7 +102,74 @@ export function apply(ctx) {
 
   // —— 会话 token 用量累计（来自 assistant/message 事件的 usage 字段）——
   // 同一条 assistant 消息（turn:step 相同）只计一次，避免流式重复计数。
-  const usageBySession = new Map(); // sessionId -> { input, output, cacheRead, cacheWrite, reasoning, seen:Set }
+  // 累计结果持久化到 DSH_HOME/dsh-clawd/usage.json：插件重载或 DSH 重启后，
+  // "会话"仍显示这个会话从开始到现在的总额（而不是本次运行产生的费用）。
+  const usageDir = path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), 'dsh-clawd');
+  const usageFile = path.join(usageDir, 'usage.json');
+  const usageBySession = new Map(); // sessionId -> { input, output, cacheRead, cacheWrite, reasoning, seen:Set, at }
+  let usageSaveTimer = null;
+  const saveUsageNow = () => {
+    try {
+      const sessions = {};
+      const list = [...usageBySession.entries()]
+        .sort((a, b) => (b[1].at ?? 0) - (a[1].at ?? 0))
+        .slice(0, 30);
+      for (const [sid, u] of list) {
+        sessions[sid] = {
+          input: u.input,
+          output: u.output,
+          cacheRead: u.cacheRead,
+          cacheWrite: u.cacheWrite,
+          reasoning: u.reasoning,
+          at: u.at ?? 0,
+        };
+      }
+      fs.mkdirSync(usageDir, { recursive: true });
+      fs.writeFileSync(usageFile, JSON.stringify({ version: 1, sessions }));
+    } catch (err) {
+      ctx.logger?.warn?.('[dsh-clawd] save usage failed:', err);
+    }
+  };
+  const scheduleUsageSave = () => {
+    if (usageSaveTimer) return;
+    usageSaveTimer = setTimeout(() => {
+      usageSaveTimer = null;
+      saveUsageNow();
+    }, 1500);
+  };
+
+  // 启动时加载历史累计（文件损坏 / 首次运行则从零开始）
+  try {
+    const raw = JSON.parse(fs.readFileSync(usageFile, 'utf8'));
+    const loadNum = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
+    for (const [sid, u] of Object.entries(raw?.sessions ?? {})) {
+      if (!u || typeof u !== 'object') continue;
+      usageBySession.set(String(sid), {
+        input: loadNum(u.input),
+        output: loadNum(u.output),
+        cacheRead: loadNum(u.cacheRead),
+        cacheWrite: loadNum(u.cacheWrite),
+        reasoning: loadNum(u.reasoning),
+        seen: new Set(),
+        at: loadNum(u.at),
+      });
+    }
+  } catch {
+    /* 首次运行 / 文件损坏：从零开始 */
+  }
+
+  // 没有任何事件时（刚重启），也能显示最近一个会话的累计用量
+  if (!lastSessionId && usageBySession.size > 0) {
+    let bestSid = null;
+    let bestAt = -1;
+    for (const [sid, u] of usageBySession) {
+      if ((u.at ?? 0) > bestAt) {
+        bestAt = u.at ?? 0;
+        bestSid = sid;
+      }
+    }
+    lastSessionId = bestSid;
+  }
   const usageOf = (sessionId) => {
     const u = usageBySession.get(sessionId);
     if (!u) return null;
@@ -117,7 +187,7 @@ export function apply(ctx) {
     const key = String(event?.data?.turn ?? '') + ':' + String(event?.data?.step ?? '');
     let u = usageBySession.get(sessionId);
     if (!u) {
-      u = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, seen: new Set() };
+      u = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, seen: new Set(), at: Date.now() };
       usageBySession.set(sessionId, u);
     }
     if (u.seen.has(key)) return;
@@ -132,6 +202,8 @@ export function apply(ctx) {
     u.cacheRead += num(usage.cacheReadTokens);
     u.cacheWrite += num(usage.cacheWriteTokens);
     u.reasoning += num(usage.reasoningTokens);
+    u.at = Date.now();
+    scheduleUsageSave();
   };
 
   // —— 当前默认模型名缓存（客户端按模型折算会话费用，60s 刷新）——
@@ -148,15 +220,38 @@ export function apply(ctx) {
   };
 
   // —— DeepSeek 账户余额缓存（deepseekAccount 是可选服务，缺失时优雅降级）——
-  // 60s 刷新一次，/state 只读缓存，保持轮询低延迟。
+  // /state 只读缓存；缓存超过 10s 时在后台异步刷新一次（不阻塞轮询），
+  // 另有 30s 定时刷新兜底。上次的余额快照落盘，重启后立刻显示旧值、
+  // 随后被后台刷新覆盖 —— "余额获取有点慢"的体感修复。
+  const balanceFile = path.join(usageDir, 'balance.json');
   let balanceCache = { at: 0, value: null }; // value = { account, links, balance }
-  const refreshBalance = async () => {
-    const acct = ctx.get?.('deepseekAccount');
-    if (!acct || typeof acct.getState !== 'function') {
-      balanceCache = { at: Date.now(), value: { account: 'unavailable', links: null, balance: null } };
-      return;
+  try {
+    const raw = JSON.parse(fs.readFileSync(balanceFile, 'utf8'));
+    if (raw && typeof raw === 'object' && raw.value) {
+      balanceCache = { at: Number(raw.at) || 0, value: raw.value };
     }
+  } catch {
+    /* 首次运行：无缓存 */
+  }
+  const saveBalanceNow = () => {
     try {
+      fs.mkdirSync(usageDir, { recursive: true });
+      fs.writeFileSync(balanceFile, JSON.stringify({ at: balanceCache.at, value: balanceCache.value }));
+    } catch {
+      /* 落盘失败不影响功能 */
+    }
+  };
+  let refreshing = false;
+  const refreshBalance = async () => {
+    if (refreshing) return;
+    refreshing = true;
+    try {
+      const acct = ctx.get?.('deepseekAccount');
+      if (!acct || typeof acct.getState !== 'function') {
+        balanceCache = { at: Date.now(), value: { account: 'unavailable', links: null, balance: null } };
+        saveBalanceNow();
+        return;
+      }
       const view = await acct.getState();
       const account = view?.status === 'credential-stored' ? 'credential-stored' : 'signed-out';
       const links = view?.links ?? null;
@@ -176,12 +271,15 @@ export function apply(ctx) {
         }
       }
       balanceCache = { at: Date.now(), value: { account, links, balance } };
+      saveBalanceNow();
     } catch (err) {
       ctx.logger?.warn?.('[dsh-clawd] balance refresh failed:', err);
       balanceCache = {
         at: Date.now(),
         value: balanceCache.value ?? { account: 'unavailable', links: null, balance: null },
       };
+    } finally {
+      refreshing = false;
     }
   };
 
@@ -261,6 +359,8 @@ export function apply(ctx) {
             const rest = decodeURIComponent(u.pathname.slice(ROUTE_SEGMENT.length + 1));
             if (rest === 'state' || rest === 'state/') {
               stateHits += 1;
+              // 缓存超 10s 就在后台补一次刷新（不等它，先回旧值，下次轮询拿新值）
+              if (Date.now() - balanceCache.at > 10000) refreshBalance().catch(() => {});
               res.setHeader('Content-Type', 'application/json; charset=utf-8');
               res.setHeader('Cache-Control', 'no-store');
               res.end(JSON.stringify(snapshot()));
@@ -286,14 +386,27 @@ export function apply(ctx) {
     'dsh-clawd: 状态路由',
   );
 
-  // Balance refresh loop (60s) --------------------------------------------------
+  // Balance refresh loop (30s) --------------------------------------------------
   ctx.effect(() => {
     refreshBalance();
     const timer = setInterval(() => {
       refreshBalance().catch(() => {});
-    }, 60000);
+    }, 30000);
     return () => clearInterval(timer);
   }, 'dsh-clawd: 余额缓存');
+
+  // 落盘：插件卸载/重载前把累计用量与余额快照写回磁盘 ----------------------------
+  ctx.effect(
+    () => () => {
+      if (usageSaveTimer) {
+        clearTimeout(usageSaveTimer);
+        usageSaveTimer = null;
+      }
+      saveUsageNow();
+      saveBalanceNow();
+    },
+    'dsh-clawd: 用量落盘',
+  );
 
   // Session event folding -----------------------------------------------------
   ctx.effect(() => {
