@@ -354,6 +354,17 @@ export function apply(ctx) {
         path: ROUTE_SEGMENT,
         handler: async (req, res) => {
           try {
+            // 访问策略：只服务本机/同源请求。浏览器里打开的任意网页（跨站）无法读取本地状态，
+            // 也挡住 DNS rebinding（Host 必须是 localhost/127.0.0.1/[::1]）。
+            const host = String(req.headers.host ?? '');
+            const origin = String(req.headers.origin ?? '');
+            const localHost = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(host);
+            const localOrigin = !origin || /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/i.test(origin);
+            if (!localHost || !localOrigin) {
+              res.statusCode = 403;
+              res.end('forbidden');
+              return;
+            }
             const rawUrl = req.url || '/';
             const u = new URL(rawUrl, 'http://localhost');
             const rest = decodeURIComponent(u.pathname.slice(ROUTE_SEGMENT.length + 1));
