@@ -761,9 +761,13 @@
         }
         function onContextMenu(e) {
           e.preventDefault();
-          var x = Math.min(e.clientX, (window.innerWidth || 0) - 180);
-          var y = Math.min(e.clientY, (window.innerHeight || 0) - 260);
-          setMenu({ x: Math.max(8, x), y: Math.max(8, y) });
+          var vw = window.innerWidth || document.documentElement.clientWidth || 0;
+          var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+          var menuW = 180, menuH = 252; // 菜单近似尺寸（CSS px），贴光标弹出
+          var x = Math.max(8, Math.min(e.clientX - menuW / 2, vw - menuW - 8));
+          var y = e.clientY + 10;
+          if (y + menuH > vh - 8) y = Math.max(8, e.clientY - 10 - menuH); // 底部空间不足时翻到光标上方
+          setMenu({ x: x, y: y });
         }
 
         function sizeNow() {
