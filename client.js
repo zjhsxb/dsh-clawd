@@ -268,27 +268,36 @@
         }).join(' + ');
       }
 
-      // 会话费用估算（CNY，DeepSeek 官方 API 单价，元/百万 tokens；来源：
-      // https://api-docs.deepseek.com/zh-cn/quick_start/pricing/ ，2026-05-31 起永久价）
+      // 会话费用估算（CNY，DeepSeek 官方 API 单价，元/百万 tokens）
+      // 价格核对日期：PRICE_UPDATE（见下）。价格直接采用官方中文页（中国区）人民币标价：
+      //   https://api-docs.deepseek.com/zh-cn/quick_start/pricing/
+      // USD/CNY 换算依据：不做自行换算。官方英文页另列美元标价（flash：未命中 $0.15/$0.30、
+      // 输出 $0.60/$1.20；v4-pro：未命中 $0.66/$1.32、输出 $1.98/$3.96），与人民币页并非
+      // 固定汇率对应（隐含汇率约 6.7-6.8，随官方更新浮动），故以人民币页为唯一计价来源。
+      // 官方价格曾有过调整（如 flash 输出 2/4 → 4/8 元、v4-pro 未命中 3/6 → 4.5/9 元），
+      // 历史会话一律按现行价估算，费用显示为"约…（估）"。
       // 每族 6 元组：[命中空闲, 命中高峰, 未命中空闲, 未命中高峰, 输出空闲, 输出高峰]。
       // 高峰时段 = 北京时间周一至周五 9:00-12:00 / 14:00-18:00（不判法定节假日，仅估算）。
       // 注意：宿主上报的 input 已不含 cacheRead（total = input + output + cacheRead + cacheWrite），
       // 未命中输入直接用 input、cacheWrite 按未命中价计；reasoning 不另计——DeepSeek 的
       // 思考 token 已包含在 output 里按输出价计费，且宿主侧 reasoningTokens 恒为 0。
       // @pricing-block
+      var PRICE_UPDATE = '2026-11-19';
       var PRICE_TABLE = {
-        flash: [0.02, 0.04, 1, 2, 2, 4],
-        'v4-pro': [0.15, 0.3, 3, 6, 6, 12],
-        chat: [0.5, 1, 2, 4, 8, 16],
-        reasoner: [1, 2, 4, 8, 16, 32],
+        flash: [0.02, 0.04, 1, 2, 4, 8],
+        'v4-pro': [0.15, 0.3, 4.5, 9, 13.5, 27],
       };
       function modelFamily(model) {
         if (!model || typeof model !== 'string') return null;
         var m = model.toLowerCase();
-        if (/reasoner|r1/.test(m)) return 'reasoner';
         if (/v4[-_. ]?pro|\bpro\b/.test(m)) return 'v4-pro';
-        if (/flash/.test(m)) return 'flash';
-        if (/chat/.test(m)) return 'chat';
+        // 以下全部归入 flash 族：
+        // - deepseek-flash（现行模型名）
+        // - deepseek-v4-flash / deepseek-v4-flash-vision-exp：官方注"对应模型已下线，请求将由
+        //   DeepSeek-V4.1-Flash-1017 模型提供服务，并按 Flash 价格计费"
+        // - deepseek-chat / deepseek-reasoner（含 r1）：已于 2026-07-24 停用，停用前分别是
+        //   flash 的非思考/思考模式别名、按 flash 价格计费，历史记录按 flash 价估算
+        if (/flash|chat|reasoner|r1/.test(m)) return 'flash';
         return null; // 未知模型：不套用任何价格
       }
       function isPeakNow(d) {
@@ -300,12 +309,15 @@
         if (day === 0 || day === 6) return false;
         return (h >= 9 && h < 12) || (h >= 14 && h < 18);
       }
-      function estimateCost(u, model, now) {
+      // 核心计价：u = {input,output,cacheRead,cacheWrite}，peak = true 高峰 / false 空闲。
+      // 分段累计用它逐段计价（/state.segments 的每个分段单独算），避免"当前模型 +
+      // 当前时段给整个历史会话统一计价"。
+      function estimateCostFor(u, model, peak) {
         if (!u) return null;
         var family = modelFamily(model);
         if (!family) return null;
         var p = PRICE_TABLE[family];
-        var k = isPeakNow(now) ? 1 : 0; // 0=空闲 1=高峰
+        var k = peak ? 1 : 0; // 0=空闲 1=高峰
         var input = Number(u.input) || 0;
         var cacheRead = Number(u.cacheRead) || 0;
         var cacheWrite = Number(u.cacheWrite) || 0;
@@ -316,21 +328,58 @@
           (output / 1e6) * p[4 + k]
         );
       }
+      function estimateCost(u, model, now) {
+        return estimateCostFor(u, model, isPeakNow(now));
+      }
       function fmtMoney(v) {
         return '¥' + v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
       }
-      // 会话费用行：无用量→暂无用量；未知模型→价格未知；否则"约 ¥x.xx（估）"
-      function costLine(usage, model) {
+      // 会话费用行：优先按 /state.segments（模型 × 空闲/高峰 分段累计的用量）逐段计价；
+      // 旧宿主没有 segments，或 v1 数据迁移后 segments 与 usage 总额对不上（分段不完整、
+      // 逐段计价会低估）时，回退到"当前模型 + 当前时段"整段估算（兼容旧数据）。
+      function segBuckets(s) {
+        var n = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+        for (var i = 0; i < s.length; i++) {
+          var seg = s[i];
+          if (!seg) continue;
+          var idle = seg.idle || {};
+          var peak = seg.peak || {};
+          n.input += (Number(idle.input) || 0) + (Number(peak.input) || 0);
+          n.output += (Number(idle.output) || 0) + (Number(peak.output) || 0);
+          n.cacheRead += (Number(idle.cacheRead) || 0) + (Number(peak.cacheRead) || 0);
+          n.cacheWrite += (Number(idle.cacheWrite) || 0) + (Number(peak.cacheWrite) || 0);
+        }
+        return n;
+      }
+      function costLine(snap) {
+        var usage = snap && snap.usage;
         if (usage == null) return '暂无用量';
-        var cost = estimateCost(usage, model);
+        var segs = snap && snap.segments;
+        if (Array.isArray(segs) && segs.length > 0) {
+          var cov = segBuckets(segs);
+          var matches =
+            (Number(usage.input) || 0) === cov.input &&
+            (Number(usage.output) || 0) === cov.output &&
+            (Number(usage.cacheRead) || 0) === cov.cacheRead &&
+            (Number(usage.cacheWrite) || 0) === cov.cacheWrite;
+          if (matches) {
+            var total = 0;
+            for (var i = 0; i < segs.length; i++) {
+              var s = segs[i];
+              if (!s) continue;
+              var idleCost = estimateCostFor(s.idle, s.model, false);
+              var peakCost = estimateCostFor(s.peak, s.model, true);
+              if (idleCost === null || peakCost === null) return '价格未知';
+              total += idleCost + peakCost;
+            }
+            return '约 ' + fmtMoney(total) + '（估）';
+          }
+        }
+        var cost = estimateCost(usage, snap && snap.model);
         if (cost === null) return '价格未知';
         return '约 ' + fmtMoney(cost) + '（估）';
       }
       // @pricing-end
-
-      function fmtMoney(v) {
-        return '¥' + v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      }
 
       // 双击账本：从 /state 快照生成两行气泡文本（余额 + 会话费用估算）
       function ledgerLines(snap) {
@@ -341,7 +390,7 @@
         else if (snap.balance && snap.balance.status === 'ready') bal = totalBalance(snap.balance) || '—';
         else if (snap.balance && snap.balance.status === 'failed') bal = '查询失败';
         else bal = '加载中…';
-        return '余额：' + bal + '\n会话：' + costLine(snap.usage, snap.model);
+        return '余额：' + bal + '\n会话：' + costLine(snap);
       }
 
       var CSS = [

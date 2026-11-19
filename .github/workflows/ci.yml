@@ -14,7 +14,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          # 仓库零依赖、没有 package-lock.json，不能开 cache: npm——
+          # 否则 setup-node 报 "Dependencies lock file is not found"。
 
       # 零外部依赖：无需 npm install，直接语法检查 + node:test
       - name: Syntax check

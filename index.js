@@ -158,9 +158,15 @@ export function apply(ctx) {
           lastTurn: u.lastTurn ?? 0,
           lastStep: u.lastStep ?? 0,
           at: u.at ?? 0,
+          // v2：模型 × 空闲/高峰 分段累计（客户端逐段计价，不用当前模型/时段统算历史）
+          segments: [...u.segments.entries()].map(([model, s]) => ({
+            model,
+            idle: { input: s.idle.input, output: s.idle.output, cacheRead: s.idle.cacheRead, cacheWrite: s.idle.cacheWrite },
+            peak: { input: s.peak.input, output: s.peak.output, cacheRead: s.peak.cacheRead, cacheWrite: s.peak.cacheWrite },
+          })),
         };
       }
-      writeJsonAtomic(usageFile, { version: 1, sessions });
+      writeJsonAtomic(usageFile, { version: 2, sessions });
     } catch (err) {
       ctx.logger?.warn?.('[dsh-clawd] save usage failed:', err);
     }
@@ -174,10 +180,24 @@ export function apply(ctx) {
   };
 
   // 启动时加载历史累计（损坏留档 .bak-<ts>，首次运行从零开始）
+  // v1：无 segments（客户端回退整段估算）；v2：带 segments 分段累计。
   const loaded = readJsonSafe(usageFile);
-  if (loaded?.version === 1 && loaded.sessions) {
+  if ((loaded?.version === 1 || loaded?.version === 2) && loaded.sessions) {
     for (const [sid, u] of Object.entries(loaded.sessions)) {
       if (!u || typeof u !== 'object') continue;
+      const segments = new Map();
+      if (Array.isArray(u.segments)) {
+        for (const s of u.segments) {
+          if (!s || typeof s.model !== 'string') continue;
+          const bucket = (b) => ({
+            input: num(b?.input),
+            output: num(b?.output),
+            cacheRead: num(b?.cacheRead),
+            cacheWrite: num(b?.cacheWrite),
+          });
+          segments.set(s.model, { idle: bucket(s.idle), peak: bucket(s.peak) });
+        }
+      }
       usageBySession.set(String(sid), {
         input: num(u.input),
         output: num(u.output),
@@ -188,6 +208,7 @@ export function apply(ctx) {
         lastTurn: num(u.lastTurn),
         lastStep: num(u.lastStep),
         at: typeof u.at === 'number' && Number.isFinite(u.at) && u.at >= 0 ? u.at : 0,
+        segments,
       });
     }
   }
@@ -215,16 +236,48 @@ export function apply(ctx) {
       reasoning: u.reasoning,
     };
   };
+  const segmentsOf = (sessionId) => {
+    const u = usageBySession.get(sessionId);
+    if (!u || u.segments.size === 0) return null;
+    return [...u.segments.entries()].map(([model, s]) => ({
+      model,
+      idle: { input: s.idle.input, output: s.idle.output, cacheRead: s.idle.cacheRead, cacheWrite: s.idle.cacheWrite },
+      peak: { input: s.peak.input, output: s.peak.output, cacheRead: s.peak.cacheRead, cacheWrite: s.peak.cacheWrite },
+    }));
+  };
+  // 高峰时段判定（与 client.js @pricing-block 的 isPeakNow 保持同一规则，供分段累计用）：
+  // 北京时间周一至周五 9:00-12:00 / 14:00-18:00（不判法定节假日，仅估算）。
+  const isPeakAt = (ts) => {
+    const bj = new Date(ts + 480 * 60000);
+    const day = bj.getUTCDay();
+    const h = bj.getUTCHours();
+    if (day === 0 || day === 6) return false;
+    return (h >= 9 && h < 12) || (h >= 14 && h < 18);
+  };
+  // 分段累计：把本次事件的增量计入 (模型 × 空闲/高峰) 桶。模型取事件时刻的默认模型
+  // （60s 缓存，用户中途换模型时自然开新段）；每会话模型数上限 16，超出只计总额不计分段。
+  const addToSegment = (u, model, peak, dInput, dOutput, dCacheRead, dCacheWrite) => {
+    if (!dInput && !dOutput && !dCacheRead && !dCacheWrite) return;
+    let seg = u.segments.get(model);
+    if (!seg) {
+      if (u.segments.size >= 16) return;
+      seg = {
+        idle: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        peak: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      };
+      u.segments.set(model, seg);
+    }
+    const bucket = peak ? seg.peak : seg.idle;
+    bucket.input = Math.max(0, bucket.input + dInput);
+    bucket.output = Math.max(0, bucket.output + dOutput);
+    bucket.cacheRead = Math.max(0, bucket.cacheRead + dCacheRead);
+    bucket.cacheWrite = Math.max(0, bucket.cacheWrite + dCacheWrite);
+  };
   const addUsage = (sessionId, event) => {
     const usage = event?.data?.usage;
     if (!usage || typeof usage !== 'object') return;
     const turn = event?.data?.turn;
     const step = event?.data?.step;
-    // 缺 turn/step 的事件（非正常路径）用消息 id 生成一次性 key：只计一次、不参与替换
-    const key =
-      turn != null && step != null
-        ? String(turn) + ':' + String(step)
-        : 'msg:' + String(event?.data?.message?.id ?? 'x');
     const next = {
       input: num(usage.inputTokens),
       output: num(usage.outputTokens),
@@ -236,10 +289,20 @@ export function apply(ctx) {
     if (!u) {
       u = {
         input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0,
-        lastByKey: new Map(), lastTurn: 0, lastStep: 0, at: Date.now(),
+        lastByKey: new Map(), lastTurn: 0, lastStep: 0, at: Date.now(), segments: new Map(),
       };
       usageBySession.set(sessionId, u);
     }
+    // 去重 key：优先 turn:step；缺 turn/step 用消息 id；再缺（非正常路径）用 usage 指纹——
+    // 指纹相同的重复事件按"替换"只计一次、指纹不同各自累计（跨重启回放同样安全，不会
+    // 像固定占位 key 那样把所有无 id 事件塌缩成一条导致大量漏计）。
+    const msgId = event?.data?.message?.id;
+    const key =
+      turn != null && step != null
+        ? String(turn) + ':' + String(step)
+        : msgId != null
+          ? 'msg:' + String(msgId)
+          : 'fp:' + [next.input, next.output, next.cacheRead, next.cacheWrite, next.reasoning].join('|');
     // 跨重启水位线：重放历史事件时，早于水位线且本运行没记过的 key 一律跳过。
     // 本运行已记过的 key（lastByKey 命中）不受水位线限制——同 key 再来是"替换"。
     if (turn != null && step != null) {
@@ -251,26 +314,22 @@ export function apply(ctx) {
       }
     }
     const prev = u.lastByKey.get(key);
-    if (prev) {
-      // 替换语义：该 key 已有旧值，先减旧值再加新值（并把该 key 更新为最新值）
-      u.input += next.input - prev.input;
-      u.output += next.output - prev.output;
-      u.cacheRead += next.cacheRead - prev.cacheRead;
-      u.cacheWrite += next.cacheWrite - prev.cacheWrite;
-      u.reasoning += next.reasoning - prev.reasoning;
-      u.lastByKey.set(key, next);
-    } else {
-      u.input += next.input;
-      u.output += next.output;
-      u.cacheRead += next.cacheRead;
-      u.cacheWrite += next.cacheWrite;
-      u.reasoning += next.reasoning;
-      u.lastByKey.set(key, next);
-      if (u.lastByKey.size > 500) {
-        const first = u.lastByKey.keys().next().value;
-        if (first !== undefined) u.lastByKey.delete(first);
-      }
+    // 替换语义：该 key 已有旧值，先减旧值再加新值（并把该 key 更新为最新值）
+    const dInput = next.input - (prev ? prev.input : 0);
+    const dOutput = next.output - (prev ? prev.output : 0);
+    const dCacheRead = next.cacheRead - (prev ? prev.cacheRead : 0);
+    const dCacheWrite = next.cacheWrite - (prev ? prev.cacheWrite : 0);
+    u.input += dInput;
+    u.output += dOutput;
+    u.cacheRead += dCacheRead;
+    u.cacheWrite += dCacheWrite;
+    u.reasoning += next.reasoning - (prev ? prev.reasoning : 0);
+    u.lastByKey.set(key, next);
+    if (u.lastByKey.size > 500) {
+      const first = u.lastByKey.keys().next().value;
+      if (first !== undefined) u.lastByKey.delete(first);
     }
+    addToSegment(u, currentModel() ?? 'unknown', isPeakAt(Date.now()), dInput, dOutput, dCacheRead, dCacheWrite);
     u.at = Date.now();
     scheduleUsageSave();
   };
@@ -322,7 +381,7 @@ export function apply(ctx) {
       let balance = null;
       if (account === 'credential-stored' && typeof acct.getBalance === 'function') {
         const client = {
-          version: 'dsh-clawd/0.1.1',
+          version: 'dsh-clawd/0.1.2',
           locale: 'zh-CN',
           timezoneOffsetSeconds: -new Date().getTimezoneOffset() * 60,
         };
@@ -356,6 +415,7 @@ export function apply(ctx) {
       task: e?.task ?? null,
       sessionId: sid ?? null,
       usage: sid ? usageOf(sid) : null,
+      segments: sid ? segmentsOf(sid) : null,
       model: currentModel(),
       account: b?.account ?? 'unavailable',
       links: b?.links ?? null,
@@ -411,15 +471,22 @@ export function apply(ctx) {
     return e;
   };
 
-  // 状态机看门狗：waiting/working/thinking/result 若 5 分钟没有任何新事件（会话卡死、
-  // turn/end 丢失、agent 进程异常），自动清条目回空闲，避免宠物永久卡在一个表情。
-  // success/error 有自己的 8s 终态清除（TERMINAL_CLEAR_MS），不受此看门狗影响。
-  const STALL_CLEAR_MS = 5 * 60 * 1000;
+  // 状态机看门狗：会话卡死（turn/end 丢失、agent 进程异常）时自动清条目回空闲，
+  // 避免宠物永久卡在一个表情。按状态给不同阈值：
+  //   thinking 15 分钟——流式输出期间的 assistant/message 会不断续命，这里只兜底真卡死；
+  //   working 30 分钟——单个长工具（构建/下载）可能跑很久，不能 5 分钟就清；
+  //   result 5 分钟——tool/result 之后 turn/end 应当秒级到达，5 分钟无动静即卡死。
+  // waiting（问用户/等审批）**绝不被看门狗清除**——用户可能离开很久，等待状态本身是真实的，
+  // 由后续的用户回答/approval 事件或 turn/end 自然推进。
+  // success/error 有自己的 8s 终态清除（TERMINAL_CLEAR_MS），不受看门狗影响。
+  const STALL_CLEAR_MS = { thinking: 15 * 60 * 1000, working: 30 * 60 * 1000, result: 5 * 60 * 1000 };
   const sweepStalledEntries = () => {
     const now = Date.now();
     for (const [sid, e] of entries) {
-      if (!e.state || e.state === 'success' || e.state === 'error') continue;
-      if (now - (e.at ?? 0) > STALL_CLEAR_MS) clearEntry(sid);
+      if (!e.state) continue;
+      const limit = STALL_CLEAR_MS[e.state];
+      if (!limit) continue; // waiting / success / error：不参与看门狗
+      if (now - (e.at ?? 0) > limit) clearEntry(sid);
     }
   };
 
@@ -549,6 +616,7 @@ export function apply(ctx) {
         }
         case 'assistant/message': {
           addUsage(sessionId, event); // 累计 token 用量（双击螃蟹查看）
+          if (e) e.at = Date.now(); // 流式输出期间续命，防长输出被看门狗误清 thinking
           return;
         }
         case 'user/message': {

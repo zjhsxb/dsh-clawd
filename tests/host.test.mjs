@@ -1,7 +1,7 @@
 // dsh-clawd host tests: usage accounting, persistence, and HTTP guard.
 // Runs against the REAL index.js (no DSH imports needed — it only imports
 // node builtins), driven through a fake cordis ctx.
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -99,7 +99,7 @@ test('usage accumulates per turn:step and sessions are isolated', async () => {
   dispose(ctx); // flushes usage.json
   const file = path.join(process.env.DSH_HOME, 'dsh-clawd', 'usage.json');
   const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
-  assert.equal(saved.version, 1);
+  assert.equal(saved.version, 2);
   assert.equal(saved.sessions.s1.input, 300);
   assert.equal(saved.sessions.s1.output, 130);
   assert.equal(saved.sessions.s2.input, 999);
@@ -236,4 +236,178 @@ test('unknown path → 404', async () => {
   await ctx.routes[0].handler({ method: 'GET', url: ROUTE + '/nope', headers: { host: '127.0.0.1:3695' } }, res);
   assert.equal(res.statusCode, 404);
   dispose(ctx);
+});
+
+// ---------------------------------------------------------------------------
+// 0.1.2: dedup without turn/step/message.id (fingerprint keys)
+// ---------------------------------------------------------------------------
+
+test('dedup: events WITHOUT turn/step/message.id — identical usage collapses, different usage accumulates', async () => {
+  process.env.DSH_HOME = tempHome();
+  const ctx = makeCtx();
+  apply(ctx);
+  const noIds = (usage) => ({ usage }); // no turn, no step, no message.id
+  emit(ctx, 's1', 'assistant/message', noIds({ inputTokens: 100, outputTokens: 50 }));
+  emit(ctx, 's1', 'assistant/message', noIds({ inputTokens: 100, outputTokens: 50 })); // duplicate → replaced
+  emit(ctx, 's1', 'assistant/message', noIds({ inputTokens: 20, outputTokens: 5 })); // different → added
+
+  const res = await getState(ctx);
+  const u = JSON.parse(res.body).usage;
+  assert.equal(u.input, 120); // 100 + 20 — not 220, not 20 (old 'msg:x' bug collapsed ALL to one key)
+  assert.equal(u.output, 55);
+  dispose(ctx);
+});
+
+test('dedup: message.id key used when turn/step missing', async () => {
+  process.env.DSH_HOME = tempHome();
+  const ctx = makeCtx();
+  apply(ctx);
+  const withId = (id, usage) => ({ message: { id }, usage });
+  emit(ctx, 's1', 'assistant/message', withId('m1', { inputTokens: 100 }));
+  emit(ctx, 's1', 'assistant/message', withId('m1', { inputTokens: 300 })); // same id → replace
+  emit(ctx, 's1', 'assistant/message', withId('m2', { inputTokens: 10 })); // new id → add
+
+  const res = await getState(ctx);
+  assert.equal(JSON.parse(res.body).usage.input, 310);
+  dispose(ctx);
+});
+
+// ---------------------------------------------------------------------------
+// 0.1.2: usage segmented by (model × idle/peak) so the client prices history
+// per actual model + period instead of current model + current period
+// ---------------------------------------------------------------------------
+
+test('segments: model split across restarts is kept; idle+peak sums equal totals', async () => {
+  const home = tempHome();
+  process.env.DSH_HOME = home;
+
+  // run 1: model = deepseek-flash
+  let ctx = makeCtx();
+  let model = 'deepseek-flash';
+  ctx.get = (name) => (name === 'agentDefaultModel' ? { currentSelection: () => ({ model }) } : undefined);
+  apply(ctx);
+  emit(ctx, 's1', 'assistant/message', usageEvent(1, 1, { inputTokens: 100, outputTokens: 10 }));
+  dispose(ctx); // flush usage.json v2
+
+  // run 2: model = deepseek-v4-pro (60s model cache in run 1 can't be beaten
+  // by a mid-run switch, so the realistic split is across restarts)
+  ctx = makeCtx();
+  model = 'deepseek-v4-pro';
+  ctx.get = (name) => (name === 'agentDefaultModel' ? { currentSelection: () => ({ model }) } : undefined);
+  apply(ctx);
+  emit(ctx, 's1', 'assistant/message', usageEvent(2, 1, { inputTokens: 200, outputTokens: 20 }));
+
+  const body = JSON.parse((await getState(ctx)).body);
+  assert.equal(body.usage.input, 300);
+  const segs = body.segments;
+  assert.ok(Array.isArray(segs) && segs.length === 2, 'two model segments');
+  const byModel = Object.fromEntries(segs.map((s) => [s.model, s]));
+  const tot = (s) => s.idle.input + s.peak.input;
+  assert.equal(tot(byModel['deepseek-flash']), 100);
+  assert.equal(tot(byModel['deepseek-v4-pro']), 200);
+  // idle/peak buckets across segments must reconcile with the overall totals
+  assert.equal(
+    segs.reduce((n, s) => n + s.idle.input + s.peak.input, 0),
+    body.usage.input,
+  );
+  dispose(ctx);
+
+  const file = path.join(home, 'dsh-clawd', 'usage.json');
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(saved.version, 2);
+  assert.ok(Array.isArray(saved.sessions.s1.segments));
+  assert.equal(saved.sessions.s1.segments.length, 2);
+});
+
+test('segments: usage.json v1 (no segments) loads totals and reports segments=null (client falls back)', async () => {
+  const home = tempHome();
+  process.env.DSH_HOME = home;
+  const dir = path.join(home, 'dsh-clawd');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'usage.json'),
+    JSON.stringify({
+      version: 1,
+      sessions: {
+        s1: { input: 42, output: 7, cacheRead: 0, cacheWrite: 0, reasoning: 0, lastTurn: 2, lastStep: 3, at: 1700000000000 },
+      },
+    }),
+  );
+
+  const ctx = makeCtx();
+  apply(ctx);
+  const body = JSON.parse((await getState(ctx)).body);
+  assert.equal(body.usage.input, 42);
+  assert.equal(body.segments, null); // v1 → no segments → client uses fallback estimate
+  dispose(ctx);
+
+  // flushed file is migrated to v2
+  const saved = JSON.parse(fs.readFileSync(path.join(dir, 'usage.json'), 'utf8'));
+  assert.equal(saved.version, 2);
+  assert.deepEqual(saved.sessions.s1.segments, []);
+});
+
+// ---------------------------------------------------------------------------
+// 0.1.2: watchdog must not clear waiting / long-running tasks
+// ---------------------------------------------------------------------------
+
+test('watchdog: waiting survives indefinitely; long stream keeps thinking alive; stuck state cleared', async () => {
+  const home = tempHome();
+  process.env.DSH_HOME = home;
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const ctx = makeCtx();
+  try {
+    apply(ctx);
+
+    // s1 → waiting (ask_user_question): must survive 30+ minutes
+    emit(ctx, 's1', 'turn/start');
+    emit(ctx, 's1', 'tool/call', { name: 'ask_user_question', callId: 'c1' });
+    assert.equal(JSON.parse((await getState(ctx)).body).state, 'waiting');
+    mock.timers.tick(30 * 60 * 1000);
+    assert.equal(JSON.parse((await getState(ctx)).body).state, 'waiting', 'waiting never watchdog-cleared');
+    emit(ctx, 's1', 'turn/end', { reason: { kind: 'aborted' } }); // resolve s1 (waiting wins pickDisplayed otherwise)
+
+    // s2 → thinking: stream chunks keep refreshing it past 15 min
+    emit(ctx, 's2', 'turn/start');
+    mock.timers.tick(10 * 60 * 1000);
+    emit(ctx, 's2', 'assistant/message', usageEvent(9, 1, { inputTokens: 10 }));
+    mock.timers.tick(10 * 60 * 1000); // age 10min < 15min → still thinking
+    let res = await getState(ctx);
+    assert.equal(JSON.parse(res.body).state, 'thinking');
+    assert.equal(JSON.parse(res.body).sessionId, 's2');
+
+    // silence for 16 more minutes → thinking exceeds 15min → cleared to idle
+    mock.timers.tick(16 * 60 * 1000);
+    res = await getState(ctx);
+    assert.equal(JSON.parse(res.body).state, null, 'stuck thinking cleared by watchdog');
+  } finally {
+    dispose(ctx);
+    mock.timers.reset();
+  }
+});
+
+test('watchdog: working (long tool run) survives 10 minutes; result cleared after 5 minutes', async () => {
+  const home = tempHome();
+  process.env.DSH_HOME = home;
+  mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'] });
+  const ctx = makeCtx();
+  try {
+    apply(ctx);
+
+    // s1 → working: a single long tool call, no events for 10 min → must survive (30min limit)
+    emit(ctx, 's1', 'turn/start');
+    emit(ctx, 's1', 'tool/call', { name: 'run_command', callId: 'c9' });
+    assert.equal(JSON.parse((await getState(ctx)).body).state, 'working');
+    mock.timers.tick(10 * 60 * 1000);
+    assert.equal(JSON.parse((await getState(ctx)).body).state, 'working', 'long tool run not cleared');
+
+    // s1 result: tool/result arrives, then silence → result limit is 5 min
+    emit(ctx, 's1', 'tool/result', { message: { source: { callId: 'c9' } } });
+    assert.equal(JSON.parse((await getState(ctx)).body).state, 'result');
+    mock.timers.tick(6 * 60 * 1000);
+    assert.equal(JSON.parse((await getState(ctx)).body).state, null, 'stale result cleared after 5 min');
+  } finally {
+    dispose(ctx);
+    mock.timers.reset();
+  }
 });

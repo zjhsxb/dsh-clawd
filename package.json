@@ -1,6 +1,6 @@
 {
   "name": "dsh-clawd",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Clawd娘: a Claude-inspired pixel crab desktop pet for DeepSeek Harness. Non-official fan work, not affiliated with Anthropic.",
   "license": "MIT",
   "author": "dsh-clawd contributors",
