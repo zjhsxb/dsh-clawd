@@ -268,24 +268,65 @@
         }).join(' + ');
       }
 
-      // 会话费用估算（CNY，按 DeepSeek 官方标准时段单价，百万 token）
-      // deepseek-chat: 输入缓存命中 ¥0.5 / 未命中 ¥2 / 输出 ¥8
-      // deepseek-reasoner: 命中 ¥1 / 未命中 ¥4 / 输出 ¥16（reasoning 按输出计）
-      // 注意：宿主上报的 input 已不含 cacheRead（total = input + output + cacheRead），
-      // 所以未命中输入直接用 input；cacheWrite 按未命中价计。
-      function estimateCost(u, model) {
+      // 会话费用估算（CNY，DeepSeek 官方 API 单价，元/百万 tokens；来源：
+      // https://api-docs.deepseek.com/zh-cn/quick_start/pricing/ ，2026-05-31 起永久价）
+      // 每族 6 元组：[命中空闲, 命中高峰, 未命中空闲, 未命中高峰, 输出空闲, 输出高峰]。
+      // 高峰时段 = 北京时间周一至周五 9:00-12:00 / 14:00-18:00（不判法定节假日，仅估算）。
+      // 注意：宿主上报的 input 已不含 cacheRead（total = input + output + cacheRead + cacheWrite），
+      // 未命中输入直接用 input、cacheWrite 按未命中价计；reasoning 不另计——DeepSeek 的
+      // 思考 token 已包含在 output 里按输出价计费，且宿主侧 reasoningTokens 恒为 0。
+      // @pricing-block
+      var PRICE_TABLE = {
+        flash: [0.02, 0.04, 1, 2, 2, 4],
+        'v4-pro': [0.15, 0.3, 3, 6, 6, 12],
+        chat: [0.5, 1, 2, 4, 8, 16],
+        reasoner: [1, 2, 4, 8, 16, 32],
+      };
+      function modelFamily(model) {
+        if (!model || typeof model !== 'string') return null;
+        var m = model.toLowerCase();
+        if (/reasoner|r1/.test(m)) return 'reasoner';
+        if (/v4[-_. ]?pro|\bpro\b/.test(m)) return 'v4-pro';
+        if (/flash/.test(m)) return 'flash';
+        if (/chat/.test(m)) return 'chat';
+        return null; // 未知模型：不套用任何价格
+      }
+      function isPeakNow(d) {
+        d = d || new Date();
+        // 北京时间 = UTC+8，与宿主机时区无关；getTimezoneOffset 会随用户时区漂移，不能参与换算。
+        var bj = new Date(d.getTime() + 480 * 60000);
+        var day = bj.getUTCDay();
+        var h = bj.getUTCHours();
+        if (day === 0 || day === 6) return false;
+        return (h >= 9 && h < 12) || (h >= 14 && h < 18);
+      }
+      function estimateCost(u, model, now) {
         if (!u) return null;
-        var reasoner = /reasoner|r1/i.test(String(model || ''));
-        var hit = reasoner ? 1 : 0.5;
-        var miss = reasoner ? 4 : 2;
-        var out = reasoner ? 16 : 8;
+        var family = modelFamily(model);
+        if (!family) return null;
+        var p = PRICE_TABLE[family];
+        var k = isPeakNow(now) ? 1 : 0; // 0=空闲 1=高峰
         var input = Number(u.input) || 0;
         var cacheRead = Number(u.cacheRead) || 0;
         var cacheWrite = Number(u.cacheWrite) || 0;
         var output = Number(u.output) || 0;
-        var reasoning = Number(u.reasoning) || 0;
-        return ((input + cacheWrite) / 1e6) * miss + (cacheRead / 1e6) * hit + (output / 1e6) * out + (reasoning / 1e6) * out;
+        return (
+          ((input + cacheWrite) / 1e6) * p[2 + k] +
+          (cacheRead / 1e6) * p[k] +
+          (output / 1e6) * p[4 + k]
+        );
       }
+      function fmtMoney(v) {
+        return '¥' + v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      }
+      // 会话费用行：无用量→暂无用量；未知模型→价格未知；否则"约 ¥x.xx（估）"
+      function costLine(usage, model) {
+        if (usage == null) return '暂无用量';
+        var cost = estimateCost(usage, model);
+        if (cost === null) return '价格未知';
+        return '约 ' + fmtMoney(cost) + '（估）';
+      }
+      // @pricing-end
 
       function fmtMoney(v) {
         return '¥' + v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -300,9 +341,7 @@
         else if (snap.balance && snap.balance.status === 'ready') bal = totalBalance(snap.balance) || '—';
         else if (snap.balance && snap.balance.status === 'failed') bal = '查询失败';
         else bal = '加载中…';
-        var cost = estimateCost(snap.usage, snap.model);
-        var line2 = cost === null ? '暂无用量' : fmtMoney(cost);
-        return '余额：' + bal + '\n会话：' + line2;
+        return '余额：' + bal + '\n会话：' + costLine(snap.usage, snap.model);
       }
 
       var CSS = [
@@ -341,6 +380,29 @@
             ctx.fillRect(c, r, 1, 1);
           }
         }
+      }
+
+      // —— 帧缓存：每帧 576 次 fillRect 很贵，改为预渲染 24×24 源画布后 drawImage。
+      // 键 = mood|frameIndex|facing；命中率 ≈100%（11 状态 × 帧数 × 2 朝向，总量很小）。
+      var frameCache = new Map();
+      function getFrameCanvas(mood, frameIdx, grid, facing) {
+        var key = mood + '|' + frameIdx + '|' + facing;
+        var hit = frameCache.get(key);
+        if (hit) return hit;
+        var c = document.createElement('canvas');
+        c.width = GRID;
+        c.height = GRID;
+        var g = c.getContext('2d');
+        g.save();
+        if (facing === -1) {
+          g.translate(GRID, 0);
+          g.scale(-1, 1);
+        }
+        drawGrid(g, grid);
+        g.restore();
+        if (frameCache.size > 512) frameCache.clear();
+        frameCache.set(key, c);
+        return c;
       }
 
       function loadSave() {
@@ -583,27 +645,40 @@
             if (canvas) {
               var ctx = canvas.getContext('2d');
               var grid = frames[Math.min(s.frame, frames.length - 1)];
-              ctx.save();
-              if (s.facing === -1) {
-                ctx.translate(GRID, 0);
-                ctx.scale(-1, 1);
-              }
-              drawGrid(ctx, grid);
-              ctx.restore();
+              // 预渲染缓存：同 mood+帧+朝向 只画一次 fillRect，之后全是 drawImage
+              var src = getFrameCanvas(s.mood, s.frame, grid, s.facing);
+              ctx.clearRect(0, 0, GRID, GRID);
+              ctx.drawImage(src, 0, 0);
             }
             var pet = petRef.current;
             if (pet) {
-              pet.style.width = S + 'px';
-              pet.style.height = S + 'px';
+              // 未变化不写 DOM（宽高只在换挡位时变；squash 只在落地/拖拽时变）
+              if (pet._w !== S) {
+                pet._w = S;
+                pet.style.width = S + 'px';
+                pet.style.height = S + 'px';
+              }
               var squash = s.squashUntil && now < s.squashUntil ? 0.86 : 1;
-              pet.style.transform = 'translate(' + s.x + 'px,' + s.y + 'px) scaleY(' + squash + ')';
+              var tf = 'translate(' + s.x + 'px,' + s.y + 'px) scaleY(' + squash + ')';
+              if (pet._tf !== tf) {
+                pet._tf = tf;
+                pet.style.transform = tf;
+              }
             }
             var shadow = shadowRef.current;
             if (shadow) {
               var h = Math.max(0, box.floor + GRID * sc - (s.y + GRID * sc));
               var ratio = 1 - Math.min(1, h / (GRID * sc * 2));
-              shadow.style.width = Math.round((8 + 10 * ratio) * sc) + 'px';
-              shadow.style.opacity = String(0.12 + 0.14 * ratio);
+              var sw = Math.round((8 + 10 * ratio) * sc);
+              var so = String(0.12 + 0.14 * ratio);
+              if (shadow._sw !== sw) {
+                shadow._sw = sw;
+                shadow.style.width = sw + 'px';
+              }
+              if (shadow._so !== so) {
+                shadow._so = so;
+                shadow.style.opacity = so;
+              }
             }
           }
 
@@ -638,7 +713,14 @@
           }
           poll();
           var timer = setInterval(poll, 1500);
-          return function () { stopped = true; clearInterval(timer); };
+          // 后台标签页：rAF 已自动暂停，轮询降到 60s（后台无需实时表情，省电+省接口）。
+          function onVis() {
+            clearInterval(timer);
+            timer = setInterval(poll, document.hidden ? 60000 : 1500);
+            if (!document.hidden) poll();
+          }
+          document.addEventListener('visibilitychange', onVis);
+          return function () { stopped = true; clearInterval(timer); document.removeEventListener('visibilitychange', onVis); };
         }, []);
 
         // —— 睡觉 / 唤醒联动 ——

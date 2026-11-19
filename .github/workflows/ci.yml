@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 零外部依赖：无需 npm install，直接语法检查 + node:test
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check client.js
+
+      - name: Unit tests (host / pricing / sprite)
+        run: npm test
+
+      # 精灵块与生成物必须同步：preview.mjs 重新生成 assets 后 diff 必须为空
+      - name: Sprite assets in sync
+        run: |
+          node scripts/preview.mjs
+          git diff --exit-code -- assets/icon.svg assets/preview.png
+
+      # 发布包完整性：files 白名单打包干跑
+      - name: Pack dry-run
+        run: npm pack --dry-run

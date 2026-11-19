@@ -1,0 +1,38 @@
+name: 反馈 / Bug 报告
+description: 报告 dsh-clawd（Clawd 娘桌宠）的问题或建议
+labels: []
+body:
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DSH 版本
+      description: 设置 → 关于 里显示的 DeepSeek Harness 版本号
+      placeholder: 例：0.2.2-rc.3
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: 操作系统
+      placeholder: 例：Windows 11 23H2 / macOS 15
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 问题描述
+      description: 发生了什么？期望发生什么？截图或录屏会很有帮助。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: 1. 打开 DSH\n2. 右键点击螃蟹\n3. …
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 附加信息（可选）
+      description: 控制台报错、DSH 日志、`/dsh-clawd-7788/health` 的输出等
